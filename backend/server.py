@@ -1,3 +1,5 @@
+import asyncio
+
 import tornado.ioloop
 import tornado.web
 import tornado.websocket
@@ -10,48 +12,56 @@ class SpreadsheetWebSocketHandler(tornado.websocket.WebSocketHandler):
     clients = set()
 
     def open(self):
-        SpreadsheetWebSocketHandler.clients.add(self)
-        print("WebSocket opened: New client connected.")
+        """Handles new WebSocket connections."""
+        self.clients.add(self)
+        print(f"✅ New WebSocket connection: {self.request.remote_ip}")
 
     def on_message(self, message):
-        try:
-            print(f"Received message from client: {message}")
-            data = json.loads(message)
-            row, column, value = data['row'], data['column'], data['value']
+        """Handles incoming WebSocket messages and broadcasts them."""
+        print(f"📥 WebSocket received: {message}")
+        asyncio.create_task(self.process_message(message))
 
-            # Update database
-            update_cell(self.application.db_conn, row, column, value)
-            print(f"Database updated: row={row}, column={column}, value={value}")
+    async def process_message(self, message):
+        """Processes the message and sends it to Redis."""
+        redis_client = await aioredis.create_redis_pool("redis://localhost:6379")
+        data = json.loads(message)
+        await redis_client.xadd("spreadsheet_updates", data)
+        redis_client.close()
+        await redis_client.wait_closed()
+        await self.broadcast_message(message)  # Ensure message is broadcasted
 
-            # Publish the update to Redis
-            tornado.ioloop.IOLoop.current().spawn_callback(publish_update, row, column, value)
-            print(f"Update published to Redis: row={row}, column={column}, value={value}")
-        except Exception as e:
-            print(f"Error processing message: {e}")
+    async def broadcast_message(self, message):
+        """Sends the message to all connected clients."""
+        print(f"📢 Broadcasting message: {message}")
+        for client in self.clients:
+            if client.ws_connection and client.ws_connection.stream.socket:
+                await client.write_message(message)
 
     def on_close(self):
-        SpreadsheetWebSocketHandler.clients.remove(self)
-        print("WebSocket closed: Client disconnected.")
+        """Handles WebSocket closure."""
+        self.clients.remove(self)
+        print(f"❌ WebSocket closed: {self.request.remote_ip}")
 
-    @classmethod
-    async def broadcast_update(cls, row, column, value):
-        update_message = json.dumps({"row": row, "column": column, "value": value})
-        for client in cls.clients:
-            try:
-                client.write_message(update_message)
-            except Exception as e:
-                print(f"Error broadcasting update to client: {e}")
 
 
 # Periodic task to listen to Redis Stream and broadcast updates
 async def stream_to_clients():
-    print("Listening to Redis Stream for updates...")
-    async for update in listen_to_stream():
-        row = update["row"]
-        column = update["column"]
-        value = update["value"]
-        print(f"Received update from Redis: row={row}, column={column}, value={value}")
-        await SpreadsheetWebSocketHandler.broadcast_update(row, column, value)
+    redis_client = await aioredis.from_url("redis://localhost:6379")
+
+    # Listening to the Redis stream
+    while True:
+        # Wait for new messages in the stream
+        result = await redis_client.xread({'spreadsheet_updates': '0'}, block=0, count=1)
+        for stream, messages in result:
+            for message in messages:
+                # Parse the message
+                message_data = message[1]
+                row = message_data['row']
+                column = message_data['column']
+                value = message_data['value']
+                # Broadcast the update to clients
+                print(f"Broadcasting update to clients: {row}, {column}, {value}")
+                await SpreadsheetWebSocketHandler.broadcast_update(row, column, value)
 
 
 def make_app():
